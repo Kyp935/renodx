@@ -381,19 +381,35 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
         renodx::mods::swapchain::expected_constant_buffer_index = 13;
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
-        renodx::mods::swapchain::use_resource_cloning = true;
-        // The main menu draws nothing visible unless the proxy pass restores the device context
-        // state it changes; the menu appears to keep its render target bound across presents.
-        renodx::mods::swapchain::swapchain_proxy_revert_state = true;
-        renodx::mods::swapchain::swap_chain_proxy_shaders = {
-            {
-                reshade::api::device_api::d3d11,
+        {
+          // Diagnostic for the black main menu: Off skips the float clone and the final HDR pass,
+          // so the game draws straight into the HDR swapchain with wrong colors but visible content.
+          auto* setting = new renodx::utils::settings::Setting{
+              .key = "SwapChainProxy",
+              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+              .default_value = 1.f,
+              .label = "Swapchain Proxy (Debug)",
+              .section = "Display Output",
+              .tooltip = "Off draws the game straight to the HDR swapchain without the final HDR pass. Colors will be wrong. Requires restart.",
+              .labels = {"Off", "On"},
+              .is_global = true,
+              .is_visible = []() { return current_settings_mode >= 2; },
+          };
+          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
+          if (setting->GetValue() == 1.f) {
+            renodx::mods::swapchain::use_resource_cloning = true;
+            renodx::mods::swapchain::swap_chain_proxy_shaders = {
                 {
-                    .vertex_shader = __swap_chain_proxy_vertex_shader_dx11,
-                    .pixel_shader = __swap_chain_proxy_pixel_shader_dx11,
+                    reshade::api::device_api::d3d11,
+                    {
+                        .vertex_shader = __swap_chain_proxy_vertex_shader_dx11,
+                        .pixel_shader = __swap_chain_proxy_pixel_shader_dx11,
+                    },
                 },
-            },
-        };
+            };
+          }
+          settings.push_back(setting);
+        }
 
         {
           auto* setting = new renodx::utils::settings::Setting{

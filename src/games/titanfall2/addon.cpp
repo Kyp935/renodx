@@ -434,28 +434,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           settings.push_back(setting);
         }
 
-        {
-          // Output format is chosen when the swapchain is created, so a change applies after restarting the game.
-          auto* setting = new renodx::utils::settings::Setting{
-              .key = "SwapChainOutput",
-              .binding = &shader_injection.swap_chain_encoding,
-              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 0.f,
-              .label = "HDR Output",
-              .section = "Display Output",
-              .tooltip = "HDR10 (10-bit PQ) or scRGB (16-bit float) swapchain. Requires restart.",
-              .labels = {"HDR10", "scRGB"},
-              // Matches renodx::draw::ENCODING_PQ (4) and ENCODING_SCRGB (5) in draw.hlsl.
-              .parse = [](float value) { return (value == 0.f ? 4.f : 5.f); },
-              .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
-          };
-          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          const bool use_hdr10 = (setting->GetValue() == 0.f);
-          renodx::mods::swapchain::SetUseHDR10(use_hdr10);
-          shader_injection.swap_chain_encoding_color_space = (use_hdr10 ? 1.f : 0.f);
-          settings.push_back(setting);
-        }
+        // scRGB only: an HDR10 swapchain (float clone + proxy pass) presents black frames in this game,
+        // while scRGB keeps the game rendering into the float back buffer itself.
+        renodx::mods::swapchain::SetUseHDR10(false);
 
         initialized = true;
       }

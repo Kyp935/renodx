@@ -29,8 +29,8 @@
 #define RENODX_SWAP_CHAIN_DECODING             renodx::draw::ENCODING_NONE
 #define RENODX_SWAP_CHAIN_CUSTOM_COLOR_SPACE   shader_injection.swap_chain_custom_color_space
 #define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE    shader_injection.swap_chain_clamp_color_space
-#define RENODX_SWAP_CHAIN_ENCODING             renodx::draw::ENCODING_SCRGB
-#define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE renodx::color::convert::COLOR_SPACE_BT709
+#define RENODX_SWAP_CHAIN_ENCODING             shader_injection.swap_chain_encoding
+#define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
 #define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 #define CUSTOM_BLOOM                           shader_injection.custom_bloom
 
@@ -61,6 +61,8 @@ struct ShaderInjectData {
   float swap_chain_gamma_correction;
   float swap_chain_custom_color_space;
   float swap_chain_clamp_color_space;
+  float swap_chain_encoding;
+  float swap_chain_encoding_color_space;
   float custom_bloom;
 };
 

@@ -6,8 +6,7 @@ HDR for Titanfall 2 (DirectX 11). Campaign or Northstar only; do not use the ReS
 
 - The game does all of its post processing in one pixel shader (`0xA0BA6139`, `CBufEnginePost`): sharpen, pilot cloak aberration, depth of field, bloom, exposure, a per-channel filmic curve (`x(10x+0.3) / (x(10x+0.5)+1.5)`), view fades, and a 32³ sRGB color correction LUT. It writes linear color to the swapchain through an `R8G8B8A8_UNORM_SRGB` view, and the HUD is drawn on top afterwards.
 - The replacement keeps that whole chain. The vanilla graded result (curve + fades + LUT) is the SDR reference for `ToneMapPass(untonemapped, graded)`, so the vanilla look is kept and highlights extend to the chosen peak.
-- The swapchain is upgraded to scRGB (`R16G16B16A16_FLOAT`). Because the sRGB view is replaced by a linear float buffer, the intermediate stays linear. Game gamma emulation is applied by `RenderIntermediatePass`; HUD gamma emulation is applied in `SwapChainPass`.
-- HDR10 output is not offered: with an `R10G10B10A2` swapchain (float clone + proxy pass path) every presented frame was black in testing. Root cause not yet identified.
+- The swapchain is upgraded (HDR10 by default, scRGB optional). Because the sRGB view is replaced by a linear float buffer, the intermediate stays linear. Game gamma emulation is applied by `RenderIntermediatePass`; HUD gamma emulation is applied in `SwapChainPass`.
 
 ## Build
 

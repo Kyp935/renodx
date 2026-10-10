@@ -38,14 +38,18 @@ jobs:
       - name: Configure CMake (x64)
         run: cmake --preset clang-x64
 
-      - name: Build titanfall2 (x64)
-        run: cmake --build --preset clang-x64-release --target titanfall2 --verbose
+      # The devkit and MCP bridge are built from the same commit so cross-addon shared state matches the mod.
+      - name: Build titanfall2, devkit and MCP bridge (x64)
+        run: cmake --build --preset clang-x64-release --target titanfall2 devkit mcp_bridge --verbose
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: renodx-titanfall2
-          path: build/release/renodx-titanfall2.addon64
+          path: |
+            build/release/renodx-titanfall2.addon64
+            build/release/renodx-devkit.addon64
+            build/release/renodx-mcp-bridge.exe
 
       - name: Publish release
         uses: "marvinpinto/action-automatic-releases@latest"
@@ -54,4 +58,7 @@ jobs:
           automatic_release_tag: titanfall2-snapshot
           prerelease: true
           title: RenoDX Titanfall 2 Snapshot
-          files: build/release/renodx-titanfall2.addon64
+          files: |
+            build/release/renodx-titanfall2.addon64
+            build/release/renodx-devkit.addon64
+            build/release/renodx-mcp-bridge.exe

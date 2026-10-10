@@ -8,6 +8,10 @@
 
 #define DEBUG_LEVEL_0
 
+#include <algorithm>
+#include <shared_mutex>
+#include <vector>
+
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
@@ -15,6 +19,7 @@
 
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
+#include "../../utils/resource_upgrade.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/swapchain.hpp"
 #include "./shared.h"
@@ -361,6 +366,63 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   }
 }
 
+// The game's swapchain is converted from bitblt to flip model for HDR. Flip model unbinds the back buffer
+// from the immediate context on Present, but the main menu binds its render target once and keeps drawing,
+// so its draws would go nowhere. Restore the game's last render target binding after every present.
+struct ImmediateRenderTargets {
+  std::shared_mutex mutex;
+  reshade::api::command_list* cmd_list = nullptr;
+  std::vector<reshade::api::resource_view> rtvs;
+  reshade::api::resource_view dsv = {0u};
+};
+ImmediateRenderTargets immediate_render_targets;
+
+void OnInitCommandQueue(reshade::api::command_queue* queue) {
+  if (queue->get_device()->get_api() != reshade::api::device_api::d3d11) return;
+  const std::unique_lock lock(immediate_render_targets.mutex);
+  immediate_render_targets.cmd_list = queue->get_immediate_command_list();
+}
+
+void OnBindRenderTargetsAndDepthStencil(
+    reshade::api::command_list* cmd_list,
+    uint32_t count,
+    const reshade::api::resource_view* rtvs,
+    reshade::api::resource_view dsv) {
+  const std::unique_lock lock(immediate_render_targets.mutex);
+  if (cmd_list != immediate_render_targets.cmd_list) return;
+  immediate_render_targets.rtvs.assign(rtvs, rtvs + count);
+  immediate_render_targets.dsv = dsv;
+}
+
+void OnDestroyResourceView(reshade::api::device* device, reshade::api::resource_view view) {
+  const std::unique_lock lock(immediate_render_targets.mutex);
+  const bool is_bound_rtv = std::ranges::any_of(
+      immediate_render_targets.rtvs,
+      [&](const reshade::api::resource_view& rtv) { return rtv.handle == view.handle; });
+  if (is_bound_rtv || immediate_render_targets.dsv.handle == view.handle) {
+    immediate_render_targets.rtvs.clear();
+    immediate_render_targets.dsv = {0u};
+  }
+}
+
+void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
+  auto* cmd_list = queue->get_immediate_command_list();
+  std::vector<reshade::api::resource_view> rtvs;
+  reshade::api::resource_view dsv = {0u};
+  {
+    // Copy out so no lock is held while binding (a bind may re-enter OnBindRenderTargetsAndDepthStencil).
+    const std::shared_lock lock(immediate_render_targets.mutex);
+    if (cmd_list != immediate_render_targets.cmd_list) return;
+    rtvs = immediate_render_targets.rtvs;
+    dsv = immediate_render_targets.dsv;
+  }
+  if (rtvs.empty()) return;
+  const auto count = static_cast<uint32_t>(rtvs.size());
+  cmd_list->bind_render_targets_and_depth_stencil(count, rtvs.data(), dsv);
+  // Addon-issued binds do not go through the swapchain clone redirect, so apply it here as well.
+  renodx::utils::resource::upgrade::RewriteRenderTargets(cmd_list, count, rtvs.data(), dsv);
+}
+
 bool initialized = false;
 
 }  // namespace
@@ -381,35 +443,16 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
         renodx::mods::swapchain::expected_constant_buffer_index = 13;
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
-        {
-          // Diagnostic for the black main menu: Off skips the float clone and the final HDR pass,
-          // so the game draws straight into the HDR swapchain with wrong colors but visible content.
-          auto* setting = new renodx::utils::settings::Setting{
-              .key = "SwapChainProxy",
-              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 1.f,
-              .label = "Swapchain Proxy (Debug)",
-              .section = "Display Output",
-              .tooltip = "Off draws the game straight to the HDR swapchain without the final HDR pass. Colors will be wrong. Requires restart.",
-              .labels = {"Off", "On"},
-              .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
-          };
-          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          if (setting->GetValue() == 1.f) {
-            renodx::mods::swapchain::use_resource_cloning = true;
-            renodx::mods::swapchain::swap_chain_proxy_shaders = {
+        renodx::mods::swapchain::use_resource_cloning = true;
+        renodx::mods::swapchain::swap_chain_proxy_shaders = {
+            {
+                reshade::api::device_api::d3d11,
                 {
-                    reshade::api::device_api::d3d11,
-                    {
-                        .vertex_shader = __swap_chain_proxy_vertex_shader_dx11,
-                        .pixel_shader = __swap_chain_proxy_pixel_shader_dx11,
-                    },
+                    .vertex_shader = __swap_chain_proxy_vertex_shader_dx11,
+                    .pixel_shader = __swap_chain_proxy_pixel_shader_dx11,
                 },
-            };
-          }
-          settings.push_back(setting);
-        }
+            },
+        };
 
         {
           auto* setting = new renodx::utils::settings::Setting{
@@ -480,10 +523,18 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       }
 
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
 
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
       reshade::unregister_addon(h_module);
       break;
   }

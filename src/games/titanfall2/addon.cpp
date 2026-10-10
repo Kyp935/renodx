@@ -382,6 +382,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::swapchain::expected_constant_buffer_index = 13;
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
         renodx::mods::swapchain::use_resource_cloning = true;
+        // The main menu draws nothing visible unless the proxy pass restores the device context
+        // state it changes; the menu appears to keep its render target bound across presents.
+        renodx::mods::swapchain::swapchain_proxy_revert_state = true;
         renodx::mods::swapchain::swap_chain_proxy_shaders = {
             {
                 reshade::api::device_api::d3d11,

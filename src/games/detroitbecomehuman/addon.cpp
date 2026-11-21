@@ -28,9 +28,17 @@
 
 #include <Windows.h>
 
+#ifdef DETROIT_UPSCALER_FSR
+#define DETROIT_UPSCALER_NAME "DLSS/FSR"
+#else
+#define DETROIT_UPSCALER_NAME "DLAA"
+#endif
+
 #include <deps/imgui/imgui.h>
 #include <embed/shaders.h>
-#include <embed/temporal_aux_exact.h>
+// The fork references a temporal_aux_exact shader that was never committed;
+// build the committed temporal_aux.comp.vk.glsl instead.
+#include <embed/temporal_aux.h>
 #include <include/reshade.hpp>
 
 #include "../../mods/shader.hpp"
@@ -77,6 +85,15 @@ bool RestoreDofCompositeComputeState(
 }
 
 }  // namespace renodx::games::detroitbecomehuman::dlss::embedded
+
+#endif
+
+#ifdef DETROIT_UPSCALER_FSR
+namespace renodx::games::detroitbecomehuman::dlss::fsr {
+void SetTuning(int jitter_mode, bool jitter_cancellation);
+void SetActive(bool active);
+bool IsActive();
+}  // namespace renodx::games::detroitbecomehuman::dlss::fsr
 #endif
 
 namespace {
@@ -165,6 +182,17 @@ std::string peak_brightness_status =
 float aspect_ratio_mode = 1.f;
 float dlss_mode = static_cast<float>(DETROIT_DLSS_MODE_NATIVE);
 float dlaa_sharpening = 0.f;
+#ifdef DETROIT_UPSCALER_FSR
+float upscaler_backend = 0.f;  // 0 = Auto, 1 = FSR, 2 = DLSS
+float uncap_fps = 0.f;
+float resolution_scale_override = 0.f;
+float fsr_jitter_mode = 3.f;
+float fsr_jitter_cancel = 1.f;
+void SyncFsrTuning() {
+  renodx::games::detroitbecomehuman::dlss::fsr::SetTuning(
+      static_cast<int>(fsr_jitter_mode + 0.5f), fsr_jitter_cancel >= 0.5f);
+}
+#endif
 float dof_mode = 0.f;
 std::atomic_bool retinal_mode_downgraded = false;
 float dof_quality = 1.f;
@@ -301,8 +329,122 @@ bool EnsureLoadFromDllMainEntry() {
   return true;
 }
 
+#ifdef DETROIT_EFFECTS_ADDON
+// Replaces the numeric value of one key in the game's GraphicOptions.JSON. The
+// game reads that file at startup and rewrites it when its graphics options are
+// saved, so callers re-apply their choice on every launch.
+void SetGraphicsOptionNumber(const char* key_name, const char* value) {
+  const auto path = GetModulePath(nullptr).parent_path() / L"GraphicOptions.JSON";
+  const HANDLE input = CreateFileW(
+      path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (input == INVALID_HANDLE_VALUE) {
+    reshade::log::message(
+        reshade::log::level::warning,
+        "Detroit graphics options: GraphicOptions.JSON not found; nothing changed.");
+    return;
+  }
+  LARGE_INTEGER size = {};
+  std::string text;
+  if (GetFileSizeEx(input, &size) != FALSE && size.QuadPart > 0
+      && size.QuadPart < (1 << 20)) {
+    text.resize(static_cast<std::size_t>(size.QuadPart));
+    DWORD read = 0u;
+    if (ReadFile(input, text.data(), static_cast<DWORD>(text.size()), &read, nullptr)
+        == FALSE) {
+      read = 0u;
+    }
+    text.resize(read);
+  }
+  CloseHandle(input);
+  const std::string key = std::string("\"") + key_name + "\"";
+  const auto key_position = text.find(key);
+  if (key_position == std::string::npos) return;
+  const auto colon = text.find(':', key_position + key.size());
+  if (colon == std::string::npos) return;
+  auto start = colon + 1u;
+  while (start < text.size() && (text[start] == ' ' || text[start] == '\t')) ++start;
+  auto end = start;
+  while (end < text.size()
+         && ((text[end] >= '0' && text[end] <= '9') || text[end] == '.'
+             || text[end] == '-' || text[end] == '+' || text[end] == 'e'
+             || text[end] == 'E')) {
+    ++end;
+  }
+  if (end == start) return;
+  if (text.compare(start, end - start, value) == 0) return;
+  text.replace(start, end - start, value);
+  const HANDLE output = CreateFileW(
+      path.c_str(), GENERIC_WRITE, 0u, nullptr, CREATE_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (output == INVALID_HANDLE_VALUE) {
+    reshade::log::message(
+        reshade::log::level::warning,
+        "Detroit graphics options: could not write GraphicOptions.JSON.");
+    return;
+  }
+  DWORD written = 0u;
+  const BOOL ok = WriteFile(
+      output, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+  CloseHandle(output);
+  const std::string message = std::string("Detroit graphics options: ")
+                              + (ok != FALSE ? "set " : "failed to set ")
+                              + key_name + " to " + value + ".";
+  reshade::log::message(
+      ok != FALSE ? reshade::log::level::info : reshade::log::level::warning,
+      message.c_str());
+}
+
+void ApplyUncapFps() { SetGraphicsOptionNumber("FRAME_RATE_LIMIT", "4"); }
+
+// Index 0 leaves the game's own setting alone.
+constexpr const char* kResolutionScaleValues[] = {
+    nullptr, "1.0", "0.9", "0.8", "0.7"};
+
+void ApplyResolutionScaleOverride(int index) {
+  constexpr int count = static_cast<int>(std::size(kResolutionScaleValues));
+  if (index <= 0 || index >= count) return;
+  SetGraphicsOptionNumber("RESOLUTION_SCALING", kResolutionScaleValues[index]);
+}
+#endif
+
 embedded_dlss::ExtensionCache ReadExtensionCache() {
   embedded_dlss::ExtensionCache cache;
+#ifdef DETROIT_UPSCALER_FSR
+  {
+    // Pick the upscaler once per launch: DLSS needs an NVIDIA driver and
+    // nvngx_dlss.dll next to the add-on; otherwise FSR is used.
+    float choice = 0.f;  // 0 = Auto, 1 = FSR, 2 = DLSS
+    (void)reshade::get_config_value(nullptr, "renodx-preset1", "UpscalerBackend", choice);
+    std::array<wchar_t, MAX_PATH + 1u> system_directory = {};
+    const UINT system_length = GetSystemDirectoryW(
+        system_directory.data(), static_cast<UINT>(system_directory.size()));
+    const bool nvidia_driver =
+        system_length != 0u && system_length < system_directory.size()
+        && std::filesystem::exists(
+            std::filesystem::path(system_directory.data()) / L"nvapi64.dll");
+    const bool ngx_present = std::filesystem::is_regular_file(
+        GetModulePath(addon_module).parent_path() / L"nvngx_dlss.dll");
+    const bool dlss_possible = nvidia_driver && ngx_present;
+    const bool use_dlss = choice >= 1.5f ? dlss_possible : (choice < 0.5f && dlss_possible);
+    renodx::games::detroitbecomehuman::dlss::fsr::SetActive(!use_dlss);
+    reshade::log::message(
+        reshade::log::level::info,
+        use_dlss ? "Detroit upscaler: DLSS selected."
+                 : (choice >= 1.5f
+                        ? "Detroit upscaler: DLSS requested but unavailable (needs NVIDIA driver and nvngx_dlss.dll); using FSR."
+                        : "Detroit upscaler: FSR selected."));
+    if (!use_dlss) {
+      // FSR needs no NGX-specific Vulkan extensions, so there is nothing to
+      // probe. Hand the layer a valid empty cache so its early hooks attach on
+      // any DetroitBecomeHuman.exe (Steam or Epic).
+      cache.schema_version = embedded_dlss::kCacheSchemaVersion;
+      cache.ready = true;
+      cache.executable_sha256 = std::string(embedded_dlss::kSupportedExecutableSha256);
+      return cache;
+    }
+  }
+#endif
   int schema = 0;
   bool ready = false;
   (void)reshade::get_config_value(
@@ -1786,7 +1928,7 @@ renodx::mods::shader::CustomShaders effect_shaders = {
                                               }},
     {supported_build::kTemporalAaShaderCrc, {
                                                 .crc32 = supported_build::kTemporalAaShaderCrc,
-                                                .code = __temporal_aux_exact,
+                                                .code = __temporal_aux,
                                                 .on_replace = &OnTemporalAuxiliaryReplace,
                                             }},
 };
@@ -2547,12 +2689,20 @@ renodx::utils::settings::Settings settings =
                 .key = "DLSSMode",
                 .binding = &dlss_mode,
                 .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+#ifdef DETROIT_UPSCALER_FSR
+                .default_value = static_cast<float>(DETROIT_DLSS_MODE_DLAA),
+#else
                 .default_value = static_cast<float>(DETROIT_DLSS_MODE_NATIVE),
+#endif
                 .can_reset = true,
                 .label = "Temporal Anti-Aliasing",
                 .section = "DLSS",
-                .tooltip = "DLAA replaces Detroit's native TAA at output resolution. The game Resolution Scaling setting must be 100%; reduced render extents fail closed to Native TAA. DLSS Super Resolution is not included.",
-                .labels = {"Native TAA", "DLAA"},
+#ifdef DETROIT_UPSCALER_FSR
+                .tooltip = "DLSS or FSR (see Upscaler below) replaces Detroit's native TAA. At 100% Resolution Scaling it works as anti-aliasing only; lower the game's Resolution Scaling and it upscales to your output resolution.",
+#else
+                .tooltip = DETROIT_UPSCALER_NAME " replaces Detroit's native TAA at output resolution. The game Resolution Scaling setting must be 100%; reduced render extents fail closed to Native TAA. DLSS Super Resolution is not included.",
+#endif
+                .labels = {"Native TAA", DETROIT_UPSCALER_NAME},
                 .is_enabled = []() { return embedded_dlss::kDlssRuntimeEnabled; },
                 .on_change_value = [](float, float current) { ApplyDlssMode(current); },
             }},
@@ -2561,7 +2711,7 @@ renodx::utils::settings::Settings settings =
                 .binding = &dlaa_sharpening,
                 .default_value = 0.f,
                 .can_reset = true,
-                .label = "DLAA Sharpening",
+                .label = DETROIT_UPSCALER_NAME " Sharpening",
                 .section = "DLSS",
                 .tooltip = "Scene-linear RCAS applied to the successful NGX output before Detroit's DOF. Zero is an exact passthrough.",
                 .min = 0.f,
@@ -2572,6 +2722,73 @@ renodx::utils::settings::Settings settings =
                 .parse = [](float value) { return value * 0.01f; },
                 .on_change_value = [](float, float) { SyncDlaaSharpening(); },
             }},
+#ifdef DETROIT_UPSCALER_FSR
+            {{
+                .key = "UpscalerBackend",
+                .binding = &upscaler_backend,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "Upscaler (restart game to apply)",
+                .section = "DLSS",
+                .tooltip = "Auto uses DLSS when an NVIDIA driver is present and nvngx_dlss.dll is in the game folder, otherwise FSR. Restart the game after changing this. The first DLSS launch needs one extra restart.",
+                .labels = {"Auto", "FSR", "DLSS"},
+            }},
+            {{
+                .key = "UncapFps",
+                .binding = &uncap_fps,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "Uncap FPS (restart game to apply)",
+                .section = "DLSS",
+                .tooltip = "Sets the game's frame rate limit to Off in GraphicOptions.JSON each time the game starts, even if the game's own options re-enable the cap. Takes effect on the next launch.",
+                .labels = {"Off", "On"},
+                .on_change_value = [](float, float current) {
+                  if (current >= 0.5f) ApplyUncapFps();
+                },
+            }},
+            {{
+                .key = "ResolutionScaleOverride",
+                .binding = &resolution_scale_override,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "Resolution Scale (restart game to apply)",
+                .section = "DLSS",
+                .tooltip = "Sets the game's Resolution Scaling in GraphicOptions.JSON each time the game starts, so it stays put even if the game's own options change it. The game's minimum is 70%. Game setting leaves the game's menu in control. Takes effect on the next launch.",
+                .labels = {"Game setting", "100%", "90%", "80%", "70%"},
+                .on_change_value = [](float, float current) {
+                  ApplyResolutionScaleOverride(static_cast<int>(current + 0.5f));
+                },
+            }},
+            {{
+                .key = "FSRJitterMode",
+                .binding = &fsr_jitter_mode,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 3.f,
+                .can_reset = true,
+                .label = "FSR Jitter",
+                .section = "DLSS",
+                .tooltip = "If edges wobble or shimmer while the camera is still, try the other options. Takes effect immediately.",
+                .labels = {"Normal", "Flip X", "Flip Y", "Flip X+Y"},
+                .on_change_value = [](float, float) { SyncFsrTuning(); },
+                .is_visible = []() { return renodx::games::detroitbecomehuman::dlss::fsr::IsActive(); },
+            }},
+            {{
+                .key = "FSRJitterCancel",
+                .binding = &fsr_jitter_cancel,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 1.f,
+                .can_reset = true,
+                .label = "FSR Motion Vectors Include Jitter",
+                .section = "DLSS",
+                .tooltip = "Applies the next time FSR starts: switch Temporal Anti-Aliasing to Native TAA and back to FSR.",
+                .labels = {"Off", "On"},
+                .on_change_value = [](float, float) { SyncFsrTuning(); },
+                .is_visible = []() { return renodx::games::detroitbecomehuman::dlss::fsr::IsActive(); },
+            }},
+#endif
             {{
                 .key = "DLSSBootstrapStatus",
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
@@ -2580,7 +2797,7 @@ renodx::utils::settings::Settings settings =
             }},
             {{
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "The targeted DLAA Vulkan backend is unavailable; Native TAA remains active.",
+                .label = "The targeted " DETROIT_UPSCALER_NAME " Vulkan backend is unavailable; Native TAA remains active.",
                 .section = "DLSS",
                 .is_visible = []() {
                   return temporal_capture::GetStatus()
@@ -2600,7 +2817,7 @@ renodx::utils::settings::Settings settings =
             }},
             {{
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "DLAA is selected; waiting for a complete verified TAA dispatch. Native TAA fallback is active.",
+                .label = DETROIT_UPSCALER_NAME " is selected; waiting for a complete verified TAA dispatch. Native TAA fallback is active.",
                 .section = "DLSS",
                 .is_visible = []() {
                   return temporal_capture::GetStatus()
@@ -2645,7 +2862,7 @@ renodx::utils::settings::Settings settings =
             }},
             {{
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "DLAA produced a valid result for this frame.",
+                .label = DETROIT_UPSCALER_NAME " produced a valid result for this frame.",
                 .section = "DLSS",
                 .is_visible = []() {
                   return temporal_capture::GetStatus()
@@ -3072,7 +3289,18 @@ void OnPresent(
       embedded_dlss::RefreshDeferredStatus();
       const bool cache_valid =
           embedded_dlss::IsValidCache(initial_extension_cache);
+#ifdef DETROIT_UPSCALER_FSR
+      const bool fsr_selected = renodx::games::detroitbecomehuman::dlss::fsr::IsActive();
+      if (fsr_selected && !embedded_dlss::WasLoadedEarly()) {
+        embedded_dlss::SetRestartRequired();
+        reshade::log::message(
+            reshade::log::level::warning,
+            "Detroit FSR: first run - restart the game once so the addon loads early.");
+      }
+      if (!fsr_selected && (!cache_valid || !embedded_dlss::WasLoadedEarly())) {
+#else
       if (!cache_valid || !embedded_dlss::WasLoadedEarly()) {
+#endif
         const auto ngx_path =
             GetModulePath(addon_module).parent_path() / L"nvngx_dlss.dll";
         if (std::filesystem::is_regular_file(ngx_path)) {
@@ -3098,7 +3326,7 @@ void OnPresent(
           status != nullptr) {
         status->label = embedded_hooks_requested_at_startup
                             ? embedded_dlss::GetStatusText()
-                            : "Native TAA fallback: targeted DLAA backend not loaded.";
+                            : "Native TAA fallback: targeted " DETROIT_UPSCALER_NAME " backend not loaded.";
       }
       displayed_bootstrap_revision = bootstrap_revision;
     }
@@ -3174,6 +3402,15 @@ bool AttachAddon(HMODULE h_module) {
   renodx::mods::shader::force_pipeline_cloning = true;
 
 #ifdef DETROIT_EFFECTS_ADDON
+  {
+    float uncap = 0.f;
+    (void)reshade::get_config_value(nullptr, "renodx-preset1", "UncapFps", uncap);
+    if (uncap >= 0.5f) ApplyUncapFps();
+    float scale_choice = 0.f;
+    (void)reshade::get_config_value(
+        nullptr, "renodx-preset1", "ResolutionScaleOverride", scale_choice);
+    ApplyResolutionScaleOverride(static_cast<int>(scale_choice + 0.5f));
+  }
   initial_extension_cache = ReadExtensionCache();
   embedded_hooks_requested_at_startup = ReadStartupEmbeddedHookRequest();
   if (embedded_hooks_requested_at_startup) {
@@ -3202,6 +3439,9 @@ bool AttachAddon(HMODULE h_module) {
       &OnRenderDebugSettingsChanged);
   renodx::utils::settings::on_preset_changed_callbacks.emplace_back(
       &SyncDlaaSharpening);
+#ifdef DETROIT_UPSCALER_FSR
+  renodx::utils::settings::on_preset_changed_callbacks.emplace_back(&SyncFsrTuning);
+#endif
   reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
   reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
   reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
@@ -3223,6 +3463,9 @@ bool AttachAddon(HMODULE h_module) {
   OnRenderDebugSettingsChanged();
   addon_shared.data->effects_api.store(&effects_api, std::memory_order_release);
   SyncDlaaSharpening();
+#ifdef DETROIT_UPSCALER_FSR
+  SyncFsrTuning();
+#endif
 #else
   renodx::utils::settings::on_preset_changed_callbacks.emplace_back(
       &OnPeakBrightnessSettingsChanged);

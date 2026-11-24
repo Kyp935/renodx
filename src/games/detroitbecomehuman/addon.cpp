@@ -206,7 +206,7 @@ void SyncFsrTuning() {
       static_cast<int>(fsr_jitter_mode + 0.5f), fsr_jitter_cancel >= 0.5f);
 }
 #endif
-float dof_mode = 1.f;
+float dof_mode = 0.f;
 std::atomic_bool retinal_mode_downgraded = false;
 float dof_quality = 1.f;
 float dof_focus_distance = 100.f;
@@ -1986,26 +1986,8 @@ renodx::mods::shader::CustomShaders effect_shaders = {
                                                 .crc32 = supported_build::kMotionBlurShaderCrc,
                                                 .code = __0xC03380A0,
                                             }},
-    {supported_build::kDofSplitShaderCrc, {
-                                              .crc32 = supported_build::kDofSplitShaderCrc,
-                                              .code = __0xE9907978,
-                                              .on_draw = &OnDofSplitDraw,
-                                          }},
-    {supported_build::kDofGatherShaderCrc, {
-                                               .crc32 = supported_build::kDofGatherShaderCrc,
-                                               .code = __0x747E19D2,
-                                               .on_draw = &OnDofGatherDraw,
-                                           }},
-    {supported_build::kDofFillShaderCrc, {
-                                             .crc32 = supported_build::kDofFillShaderCrc,
-                                             .code = __0x508514FB,
-                                             .on_draw = &OnDofFillDraw,
-                                         }},
-    {supported_build::kDofCompositeShaderCrc, {
-                                                  .crc32 = supported_build::kDofCompositeShaderCrc,
-                                                  .code = __0xAC7A8193,
-                                                  .on_drawn = &OnDofCompositeDrawn,
-                                              }},
+    // The DOF shaders are deliberately not replaced: the game's own DOF runs
+    // untouched, including in the main menu.
     {supported_build::kTemporalAaShaderCrc, {
                                                 .crc32 = supported_build::kTemporalAaShaderCrc,
                                                 .code = __temporal_aux,
@@ -2492,7 +2474,7 @@ renodx::utils::settings::Settings settings =
                 .key = "DepthOfFieldMode",
                 .binding = &dof_mode,
                 .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-                .default_value = 1.f,
+                .default_value = 0.f,
                 .can_reset = true,
                 .label = "Depth of Field",
                 .section = "Depth of Field",
@@ -3566,6 +3548,26 @@ bool AttachAddon(HMODULE h_module) {
   renodx::utils::settings::Use(
       DLL_PROCESS_ATTACH, &settings, &OnPresetOff);
   temporal_capture::Use(DLL_PROCESS_ATTACH);
+  // The Depth of Field options are not shown and the DOF shaders are not
+  // replaced, so the game's own DOF runs untouched. Nothing saved in an old
+  // ReShade.ini can change that.
+  for (auto* setting : settings) {
+    if (setting->section.rfind("Depth of Field", 0) == 0
+        || setting->section == "Retinal DOF") {
+      setting->is_visible = []() { return false; };
+    }
+  }
+  renodx::utils::settings::UpdateSettings({
+      {"DepthOfFieldMode", 0.f},
+      {"DepthOfFieldQuality", 1.f},
+      {"DepthOfFieldFocusDistance", 100.f},
+      {"DepthOfFieldBlurRadius", 100.f},
+      {"DepthOfFieldFarStrength", 100.f},
+      {"DepthOfFieldVanillaTransition", 100.f},
+      {"DepthOfFieldFillCocReconstruction", 0.f},
+      {"DepthOfFieldFillTransition", 0.f},
+      {"DepthOfFieldFillRgbReconstruction", 0.f},
+  });
   renodx::mods::shader::use_shared_pipeline_injection = true;
   renodx::mods::shader::Use(
       DLL_PROCESS_ATTACH, effect_shaders, &shader_injection);

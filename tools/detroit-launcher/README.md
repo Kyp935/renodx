@@ -10,5 +10,15 @@ Build: run `build.cmd`, then put `renodx-detroitbecomehuman.addon64`, `renodx-de
 
 `patch-detroit-exe.ps1` is the same exe patch without the launcher.
 
-`src/utils/settings.hpp` on this branch has one change: the "Depth of Field" settings section starts collapsed.
-It is not part of the pull request to decoded-brain/renodx.
+## Differences from the pull request
+
+This branch is the release branch. Compared with the pull request to decoded-brain/renodx it has one change in
+`src/games/detroitbecomehuman/addon.cpp`: the four Depth of Field shaders are not replaced and the Depth of Field
+settings are hidden, so the game's own DOF runs untouched. With the replacements active the main menu lost its
+background blur. Decoded-brain's Native DOF v2 work is left intact in the pull request.
+
+## Notes
+
+- Tested on an RTX 4060 (DLSS) and an RX 6750 XT (FSR 3.1), Epic Games Store build. The Steam build is untested.
+- NVIDIA Smooth Motion works alongside the mod on an RTX 4060 (it needs an RTX 40-series card; its frame counter
+  includes the generated frames).

@@ -22,3 +22,7 @@ background blur. Decoded-brain's Native DOF v2 work is left intact in the pull r
 - Tested on an RTX 4060 (DLSS) and an RX 6750 XT (FSR 3.1), Epic Games Store build. The Steam build is untested.
 - NVIDIA Smooth Motion works alongside the mod on an RTX 4060 (it needs an RTX 40-series card; its frame counter
   includes the generated frames).
+- Optional, RTX only: DLSS 5 Neural Rendering via the community "DLSS5 Tool + DX11 Bridge" method (for example through
+  DLSS5 Swapper or RHI) ran on top of the mod on an RTX 4060 (Vulkan, DLSS Ultra Performance, 1148x480 to 3440x1440,
+  about 4 ms per frame, HDR). It is third-party software that is not included or supported here, it needs NVIDIA's
+  nvngx_dlssnr.dll (older cards need a modified one), and other methods (Feeder, GITC Uplift, ShortFuse DLSS Tool) are untested.

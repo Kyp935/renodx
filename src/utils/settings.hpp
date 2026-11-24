@@ -474,9 +474,11 @@ static void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
         ImGui::Indent();
         ImGui::TreePop();
       }
+      // The Depth of Field section starts collapsed.
+      const bool start_closed = setting->section == "Depth of Field";
       open_node = ImGui::TreeNodeEx(
           setting->section.c_str(),
-          ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth);
+          (start_closed ? 0 : ImGuiTreeNodeFlags_DefaultOpen) | ImGuiTreeNodeFlags_SpanFullWidth);
       if (open_node) {
         ImGui::Unindent();
       }

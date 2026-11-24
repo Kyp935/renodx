@@ -713,15 +713,27 @@ bool PickPreferredVersionLocked(Backend* backend, uint64_t* id, std::string* nam
   versions.versionNames = names.data();
   if (GuardedQuery(backend->query, nullptr, &versions.header, &fault) != FFX_API_RETURN_OK) return false;
 
+  // FSRVersion in [renodx-preset1]: 0 = Auto (newest 3.x), 1 = FSR 4.x.
+  float version_choice = 0.f;
+  (void)reshade::get_config_value(nullptr, "renodx-preset1", "FSRVersion", version_choice);
+  const char* wanted_prefix = version_choice > 0.5f ? "4." : "3.";
+
   std::string list;
   int best = -1;
+  int best_auto = -1;
   for (uint64_t i = 0u; i < count; ++i) {
     const std::string n = names[i] != nullptr ? names[i] : "?";
     if (!list.empty()) list += ", ";
     list += n;
-    if (n.rfind("3.", 0) == 0 && (best < 0 || n > std::string(names[best]))) best = static_cast<int>(i);
+    if (n.rfind(wanted_prefix, 0) == 0 && (best < 0 || n > std::string(names[best]))) best = static_cast<int>(i);
+    if (n.rfind("3.", 0) == 0 && (best_auto < 0 || n > std::string(names[best_auto]))) best_auto = static_cast<int>(i);
   }
   Log(reshade::log::level::info, std::format("available upscaler versions: {}", list));
+  if (best < 0 && best_auto >= 0) {
+    Log(reshade::log::level::warning,
+        std::format("the selected FSR version ({}x) is not available on this GPU; using the newest 3.x instead.", wanted_prefix));
+    best = best_auto;
+  }
   if (best < 0) return false;
   *id = ids[static_cast<std::size_t>(best)];
   *name = names[static_cast<std::size_t>(best)];

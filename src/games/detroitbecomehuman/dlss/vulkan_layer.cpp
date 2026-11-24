@@ -54,6 +54,11 @@
 #ifdef DETROIT_UPSCALER_FSR
 #include "fsr_backend.hpp"
 namespace fsr = renodx::games::detroitbecomehuman::dlss::fsr;
+
+namespace renodx::games::detroitbecomehuman::dlss {
+std::atomic<int> g_dlss_jitter_mode{3};
+std::atomic<bool> g_dlss_mv_jittered{false};
+}
 #endif
 
 namespace {
@@ -1176,7 +1181,8 @@ std::uint32_t ToNgxCreateFlags(DetroitDlssCreateFlags flags) {
   if ((flags & DETROIT_DLSS_CREATE_DEPTH_INVERTED) != 0u) {
     ngx_flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
   }
-  if ((flags & DETROIT_DLSS_CREATE_MOTION_VECTORS_JITTERED) != 0u) {
+  if ((flags & DETROIT_DLSS_CREATE_MOTION_VECTORS_JITTERED) != 0u
+      && renodx::games::detroitbecomehuman::dlss::g_dlss_mv_jittered.load(std::memory_order_relaxed)) {
     ngx_flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
   }
   if ((flags & DETROIT_DLSS_CREATE_AUTO_EXPOSURE) != 0u) {
@@ -1345,6 +1351,25 @@ NVSDK_NGX_Result CoreCreateFeature(
           ? NVSDK_NGX_PerfQuality_Value_MaxQuality
           : static_cast<NVSDK_NGX_PerfQuality_Value>(config->mode);
   create_parameters.InFeatureCreateFlags = static_cast<int>(config->create_flags);
+  // DLSSPreset in [renodx-preset1]: 0 = the driver's default, 1.. = preset A, B, ...
+  // The choice is applied to every quality mode. Takes effect when the feature is created.
+  {
+    float preset_choice = 0.f;
+    (void)reshade::get_config_value(nullptr, "renodx-preset1", "DLSSPreset", preset_choice);
+    constexpr unsigned kPresetValues[] = {0u, 1u, 2u, 3u, 4u, 5u, 6u, 10u, 11u, 12u, 13u};
+    const int preset_index = static_cast<int>(preset_choice + 0.5f);
+    if (parameters != nullptr && preset_index > 0
+        && preset_index < static_cast<int>(std::size(kPresetValues))) {
+      const unsigned preset = kPresetValues[preset_index];
+      for (const char* name : {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+                               "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+                               "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality"}) {
+        NVSDK_NGX_Parameter_SetUI(parameters, name, preset);
+      }
+      reshade::log::message(reshade::log::level::info,
+                            std::format("Detroit DLSS: render preset {} requested.", preset).c_str());
+    }
+  }
   return NGX_VULKAN_CREATE_DLSS_EXT1(
       device,
       command_buffer,
@@ -1375,8 +1400,9 @@ NVSDK_NGX_Result CoreEvaluateFeature(
   evaluation.pInDepth = depth;
   evaluation.pInMotionVectors = motion_vectors;
   evaluation.pInExposureTexture = exposure;
-  evaluation.InJitterOffsetX = info->jitter_x;
-  evaluation.InJitterOffsetY = info->jitter_y;
+  const int jitter_choice = renodx::games::detroitbecomehuman::dlss::g_dlss_jitter_mode.load(std::memory_order_relaxed);
+  evaluation.InJitterOffsetX = (jitter_choice == 1 || jitter_choice == 3) ? -info->jitter_x : info->jitter_x;
+  evaluation.InJitterOffsetY = (jitter_choice == 2 || jitter_choice == 3) ? -info->jitter_y : info->jitter_y;
   evaluation.InRenderSubrectDimensions = {
       info->render_width, info->render_height};
   evaluation.InReset = info->reset;

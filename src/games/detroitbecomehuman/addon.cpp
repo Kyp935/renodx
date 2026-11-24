@@ -94,6 +94,11 @@ void SetTuning(int jitter_mode, bool jitter_cancellation);
 void SetActive(bool active);
 bool IsActive();
 }  // namespace renodx::games::detroitbecomehuman::dlss::fsr
+
+namespace renodx::games::detroitbecomehuman::dlss {
+extern std::atomic<int> g_dlss_jitter_mode;
+extern std::atomic<bool> g_dlss_mv_jittered;
+}
 #endif
 
 namespace {
@@ -187,13 +192,21 @@ float upscaler_backend = 0.f;  // 0 = Auto, 1 = FSR, 2 = DLSS
 float uncap_fps = 0.f;
 float resolution_scale_override = 0.f;
 float fsr_jitter_mode = 3.f;
-float fsr_jitter_cancel = 1.f;
+float fsr_jitter_cancel = 0.f;
+float fsr_version = 0.f;   // 0 = Auto (3.x), 1 = FSR 4.x
+float dlss_preset = 0.f;   // 0 = Default, then presets A-F, J-M
+float dlss_mv_jittered = 0.f;  // 0 = Off (Detroit MVs do not include jitter), 1 = On
+float dlss_jitter_mode = 3.f;  // 0 = Normal, 1 = Flip X, 2 = Flip Y, 3 = Flip X+Y
 void SyncFsrTuning() {
+  renodx::games::detroitbecomehuman::dlss::g_dlss_mv_jittered.store(
+      dlss_mv_jittered >= 0.5f, std::memory_order_relaxed);
+  renodx::games::detroitbecomehuman::dlss::g_dlss_jitter_mode.store(
+      std::clamp(static_cast<int>(dlss_jitter_mode + 0.5f), 0, 3), std::memory_order_relaxed);
   renodx::games::detroitbecomehuman::dlss::fsr::SetTuning(
       static_cast<int>(fsr_jitter_mode + 0.5f), fsr_jitter_cancel >= 0.5f);
 }
 #endif
-float dof_mode = 0.f;
+float dof_mode = 1.f;
 std::atomic_bool retinal_mode_downgraded = false;
 float dof_quality = 1.f;
 float dof_focus_distance = 100.f;
@@ -397,13 +410,21 @@ void SetGraphicsOptionNumber(const char* key_name, const char* value) {
 
 void ApplyUncapFps() { SetGraphicsOptionNumber("FRAME_RATE_LIMIT", "4"); }
 
-// Index 0 leaves the game's own setting alone.
+// Index 0 leaves the game's own setting alone. Values below 0.7 need the
+// in-memory minimum patch (UnlockLowResolutionScale, defined further down).
+// AMD FSR presets: Native AA, Quality (1.5x), Balanced (1.7x), Performance (2x),
+// Ultra Performance (3x). Ultra Performance uses 0.334 so the render size stays
+// at or above one third of the output.
 constexpr const char* kResolutionScaleValues[] = {
-    nullptr, "1.0", "0.9", "0.8", "0.7"};
+    nullptr, "1.0", "0.667", "0.588", "0.5", "0.334"};
+constexpr int kFirstLowResolutionScaleIndex = 2;
+
+void UnlockLowResolutionScale();
 
 void ApplyResolutionScaleOverride(int index) {
   constexpr int count = static_cast<int>(std::size(kResolutionScaleValues));
   if (index <= 0 || index >= count) return;
+  if (index >= kFirstLowResolutionScaleIndex) UnlockLowResolutionScale();
   SetGraphicsOptionNumber("RESOLUTION_SCALING", kResolutionScaleValues[index]);
 }
 #endif
@@ -759,9 +780,57 @@ ultrawide::PatchOperationResult AtomicWriteRipDisplacement(
   return result;
 }
 
+#ifdef DETROIT_EFFECTS_ADDON
+// Resolution scales below the game's own 70% minimum need the game's minimum
+// changed before the game starts (it builds its setting limits before this
+// add-on loads), so that is done on the exe itself by "Patch Detroit exe.cmd".
+// This only checks whether the running exe carries that change and says so in
+// the log; it never modifies the game.
+void UnlockLowResolutionScale() {
+  constexpr std::uint32_t kEpicTimestamp = 0x64DD157Eu;
+  constexpr std::uint32_t kEpicImageSize = 0x0388F000u;
+  constexpr std::size_t kLoadRva = 0x15D076u;
+  constexpr std::array<std::uint8_t, 4> kLoadOpcode = {0xF3, 0x0F, 0x10, 0x05};
+  constexpr std::int32_t kOriginalDisplacement = 0x01D40DCE;  // -> 0.7f
+  constexpr std::int32_t kLowDisplacement = 0x01777C02;       // -> 0.1f
+
+  static std::atomic_bool reported = false;
+  if (reported.exchange(true, std::memory_order_acq_rel)) return;
+
+  const auto* module_base =
+      reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr));
+  if (module_base == nullptr) return;
+  const auto* dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(module_base);
+  if (dos_header->e_magic != IMAGE_DOS_SIGNATURE) return;
+  const auto* nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+      module_base + dos_header->e_lfanew);
+  if (nt_headers->Signature != IMAGE_NT_SIGNATURE
+      || nt_headers->FileHeader.TimeDateStamp != kEpicTimestamp
+      || nt_headers->OptionalHeader.SizeOfImage != kEpicImageSize
+      || std::memcmp(module_base + kLoadRva, kLoadOpcode.data(), kLoadOpcode.size()) != 0) {
+    reshade::log::message(
+        reshade::log::level::warning,
+        "Detroit resolution scale: scales below 70% are only supported on the Epic build of the game.");
+    return;
+  }
+  std::int32_t displacement = 0;
+  std::memcpy(&displacement, module_base + kLoadRva + kLoadOpcode.size(), sizeof(displacement));
+  if (displacement == kLowDisplacement) {
+    reshade::log::message(
+        reshade::log::level::info,
+        "Detroit resolution scale: the exe's 70% minimum is already lowered; scales below 70% are available.");
+  } else if (displacement == kOriginalDisplacement) {
+    reshade::log::message(
+        reshade::log::level::warning,
+        "Detroit resolution scale: the game's exe still has its 70% minimum, so the game will use 70% instead. Run \"Patch Detroit exe.cmd\" once to allow lower scales.");
+  }
+}
+#endif
+
 struct MainModuleText {
   std::uint8_t* module_base;
   std::span<const std::uint8_t> text;
+  const ultrawide::BuildSpec* build;
 };
 
 std::optional<MainModuleText> GetSupportedMainModuleText() {
@@ -779,8 +848,15 @@ std::optional<MainModuleText> GetSupportedMainModuleText() {
     return std::nullopt;
   }
 
-  if (nt_headers->FileHeader.TimeDateStamp != ultrawide::kSupportedExeTimestamp
-      || nt_headers->OptionalHeader.SizeOfImage != ultrawide::kSupportedExeImageSize) {
+  const ultrawide::BuildSpec* build = nullptr;
+  for (const auto& candidate_build : ultrawide::kSupportedBuilds) {
+    if (nt_headers->FileHeader.TimeDateStamp == candidate_build.timestamp
+        && nt_headers->OptionalHeader.SizeOfImage == candidate_build.image_size) {
+      build = &candidate_build;
+      break;
+    }
+  }
+  if (build == nullptr) {
     LogUltrawide(
         reshade::log::level::error,
         std::format(
@@ -798,6 +874,7 @@ std::optional<MainModuleText> GetSupportedMainModuleText() {
         .text = std::span<const std::uint8_t>(
             module_base + section[index].VirtualAddress,
             section[index].Misc.VirtualSize),
+        .build = build,
     };
   }
   return std::nullopt;
@@ -831,7 +908,7 @@ void* AllocateNearPatchData(
   };
 
   auto cursor = align_up(
-      reinterpret_cast<std::uintptr_t>(module.module_base) + ultrawide::kSupportedExeImageSize);
+      reinterpret_cast<std::uintptr_t>(module.module_base) + module.build->image_size);
   const auto upper_bound =
       reinterpret_cast<std::uintptr_t>(module.module_base) + 0x70000000u;
 
@@ -890,25 +967,27 @@ bool InstallUltrawidePatch() {
     return false;
   }
 
+  const auto& aspect_spec = *module->build->aspect;
+  const auto& ui_spec = *module->build->ui;
   auto* aspect_pattern = FindUniquePattern(
-      module.value(), ultrawide::kAspectGetterPatch.pattern, "aspect getter");
+      module.value(), aspect_spec.pattern, "aspect getter");
   auto* ui_pattern = FindUniquePattern(
-      module.value(), ultrawide::kUiHalfExtentPatch.pattern, "UI half-extent");
+      module.value(), ui_spec.pattern, "UI half-extent");
   if (aspect_pattern == nullptr || ui_pattern == nullptr) return false;
 
   auto* aspect_getter =
-      aspect_pattern + ultrawide::kAspectGetterPatch.instruction_offset;
+      aspect_pattern + aspect_spec.instruction_offset;
   auto* ui_half_extent_load =
-      ui_pattern + ultrawide::kUiHalfExtentPatch.instruction_offset;
+      ui_pattern + ui_spec.instruction_offset;
   if (std::memcmp(
           aspect_getter,
-          ultrawide::kAspectGetterPatch.instruction.data(),
-          ultrawide::kAspectGetterPatch.instruction.size())
+          aspect_spec.instruction.data(),
+          aspect_spec.instruction.size())
           != 0
       || std::memcmp(
              ui_half_extent_load,
-             ultrawide::kUiHalfExtentPatch.instruction.data(),
-             ultrawide::kUiHalfExtentPatch.instruction.size())
+             ui_spec.instruction.data(),
+             ui_spec.instruction.size())
              != 0) {
     LogUltrawide(reshade::log::level::error, "instruction validation failed.");
     return false;
@@ -916,9 +995,9 @@ bool InstallUltrawidePatch() {
 
   UltrawidePatchState candidate;
   candidate.displacement_addresses[ultrawide::kAspectPatchIndex] =
-      aspect_getter + ultrawide::kAspectGetterPatch.displacement_offset;
+      aspect_getter + aspect_spec.displacement_offset;
   candidate.displacement_addresses[ultrawide::kUiPatchIndex] =
-      ui_half_extent_load + ultrawide::kUiHalfExtentPatch.displacement_offset;
+      ui_half_extent_load + ui_spec.displacement_offset;
   std::memcpy(
       &candidate.original_displacements[ultrawide::kAspectPatchIndex],
       candidate.displacement_addresses[ultrawide::kAspectPatchIndex],
@@ -929,30 +1008,30 @@ bool InstallUltrawidePatch() {
       sizeof(std::int32_t));
   const auto aspect_original_target = reinterpret_cast<std::uintptr_t>(
                                           aspect_getter
-                                          + ultrawide::kAspectGetterPatch.instruction.size())
+                                          + aspect_spec.instruction.size())
                                       + candidate.original_displacements[ultrawide::kAspectPatchIndex];
   const auto ui_original_target = reinterpret_cast<std::uintptr_t>(
                                       ui_half_extent_load
-                                      + ultrawide::kUiHalfExtentPatch.instruction.size())
+                                      + ui_spec.instruction.size())
                                   + candidate.original_displacements[ultrawide::kUiPatchIndex];
   if (aspect_original_target
           != reinterpret_cast<std::uintptr_t>(module->module_base)
-                 + ultrawide::kAspectGetterPatch.expected_original_target_rva
+                 + aspect_spec.expected_original_target_rva
       || ui_original_target
              != reinterpret_cast<std::uintptr_t>(module->module_base)
-                    + ultrawide::kUiHalfExtentPatch.expected_original_target_rva) {
+                    + ui_spec.expected_original_target_rva) {
     LogUltrawide(
         reshade::log::level::error,
-        "original RIP targets do not match Build 12158144; aspect fix was refused.");
+        std::format("original RIP targets do not match {}; aspect fix was refused.", module->build->name));
     return false;
   }
 
   auto* runtime_data = static_cast<UltrawideRuntimeData*>(AllocateNearPatchData(
       module.value(),
       reinterpret_cast<std::uintptr_t>(
-          aspect_getter + ultrawide::kAspectGetterPatch.instruction.size()),
+          aspect_getter + aspect_spec.instruction.size()),
       reinterpret_cast<std::uintptr_t>(
-          ui_half_extent_load + ultrawide::kUiHalfExtentPatch.instruction.size())));
+          ui_half_extent_load + ui_spec.instruction.size())));
   if (runtime_data == nullptr) {
     LogUltrawide(reshade::log::level::error, "could not allocate RIP-relative runtime data.");
     return false;
@@ -964,11 +1043,11 @@ bool InstallUltrawidePatch() {
 
   const auto aspect_displacement = ultrawide::CalculateRipDisplacement(
       reinterpret_cast<std::uintptr_t>(
-          aspect_getter + ultrawide::kAspectGetterPatch.instruction.size()),
+          aspect_getter + aspect_spec.instruction.size()),
       reinterpret_cast<std::uintptr_t>(&runtime_data->aspect_ratio_bits));
   const auto ui_displacement = ultrawide::CalculateRipDisplacement(
       reinterpret_cast<std::uintptr_t>(
-          ui_half_extent_load + ultrawide::kUiHalfExtentPatch.instruction.size()),
+          ui_half_extent_load + ui_spec.instruction.size()),
       reinterpret_cast<std::uintptr_t>(&runtime_data->ui_half_extent_bits));
   if (!aspect_displacement.has_value() || !ui_displacement.has_value()) {
     ultrawide_runtime_data.store(nullptr, std::memory_order_release);
@@ -1025,7 +1104,8 @@ bool InstallUltrawidePatch() {
   LogUltrawide(
       reshade::log::level::info,
       std::format(
-          "automatic override installed for Build 12158144: swapchain {}x{}, scene aspect {:.6f}, Scaleform half-extent {:.6f}, mode {}.",
+          "automatic override installed for {}: swapchain {}x{}, scene aspect {:.6f}, Scaleform half-extent {:.6f}, mode {}.",
+          module->build->name,
           width,
           height,
           values.aspect_ratio,
@@ -2175,10 +2255,244 @@ renodx::utils::settings::Settings settings =
         renodx::templates::settings::CreateSettings({
 #ifdef DETROIT_EFFECTS_ADDON
             {{
+                .key = "DLSSMode",
+                .binding = &dlss_mode,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+#ifdef DETROIT_UPSCALER_FSR
+                .default_value = static_cast<float>(DETROIT_DLSS_MODE_DLAA),
+#else
+                .default_value = static_cast<float>(DETROIT_DLSS_MODE_NATIVE),
+#endif
+                .can_reset = true,
+                .label = "Temporal Anti-Aliasing",
+                .section = "Upscaling",
+#ifdef DETROIT_UPSCALER_FSR
+                .tooltip = "DLSS or FSR (see Upscaler below) replaces Detroit's native TAA. At 100% Resolution Scaling it works as anti-aliasing only; lower the game's Resolution Scaling and it upscales to your output resolution.",
+#else
+                .tooltip = DETROIT_UPSCALER_NAME " replaces Detroit's native TAA at output resolution. The game Resolution Scaling setting must be 100%; reduced render extents fail closed to Native TAA. DLSS Super Resolution is not included.",
+#endif
+                .labels = {"Native TAA", DETROIT_UPSCALER_NAME},
+                .is_enabled = []() { return embedded_dlss::kDlssRuntimeEnabled; },
+                .on_change_value = [](float, float current) { ApplyDlssMode(current); },
+            }},
+            {{
+                .key = "DLAASharpening",
+                .binding = &dlaa_sharpening,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = DETROIT_UPSCALER_NAME " Sharpening",
+                .section = "Upscaling",
+                .tooltip = "Scene-linear RCAS applied to the successful NGX output before Detroit's DOF. Zero is an exact passthrough.",
+                .min = 0.f,
+                .max = 100.f,
+                .is_enabled = []() { return embedded_dlss::kDlssRuntimeEnabled
+                                            && temporal_capture::GetMode()
+                                                   == DETROIT_DLSS_MODE_DLAA; },
+                .parse = [](float value) { return value * 0.01f; },
+                .on_change_value = [](float, float) { SyncDlaaSharpening(); },
+            }},
+#ifdef DETROIT_UPSCALER_FSR
+            {{
+                .key = "UpscalerBackend",
+                .binding = &upscaler_backend,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "Upscaler (restart game to apply)",
+                .section = "Upscaling",
+                .tooltip = "Auto uses DLSS when an NVIDIA driver is present and nvngx_dlss.dll is in the game folder, otherwise FSR. Restart the game after changing this. The first DLSS launch needs one extra restart.",
+                .labels = {"Auto", "FSR", "DLSS"},
+            }},
+            {{
+                .key = "UncapFps",
+                .binding = &uncap_fps,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "Uncap FPS (restart game to apply)",
+                .section = "Upscaling",
+                .tooltip = "Sets the game's frame rate limit to Off in GraphicOptions.JSON each time the game starts, even if the game's own options re-enable the cap. Takes effect on the next launch.",
+                .labels = {"Off", "On"},
+                .on_change_value = [](float, float current) {
+                  if (current >= 0.5f) ApplyUncapFps();
+                },
+            }},
+            {{
+                .key = "ResolutionScalePreset",
+                .binding = &resolution_scale_override,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "Resolution Scale (restart game to apply)",
+                .section = "Upscaling",
+                .tooltip = "Sets the game's Resolution Scaling in GraphicOptions.JSON each time the game starts, using AMD's FSR presets (Quality 1.5x, Balanced 1.7x, Performance 2x, Ultra Performance 3x). Everything below Native AA is under the game's own 70% minimum, so it also needs the one-time exe patch (Patch Detroit exe.cmd or the launcher); without it the game uses 70%. Game setting leaves the game's menu in control. Takes effect on the next launch.",
+                .labels = {"Game setting", "Native AA (100%)", "Quality (67%)", "Balanced (59%)", "Performance (50%)", "Ultra Performance (33%)"},
+                .on_change_value = [](float, float current) {
+                  ApplyResolutionScaleOverride(static_cast<int>(current + 0.5f));
+                },
+            }},
+            {{
+                .key = "FSRVersion",
+                .binding = &fsr_version,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "FSR Version (restart game to apply)",
+                .section = "Upscaling",
+                .tooltip = "Auto uses the newest FSR 3.x. FSR 4 is only offered when the AMD graphics driver provides it (some Radeon cards); otherwise the newest 3.x is used. FSR 4 can be much slower on cards without dedicated hardware for it. Takes effect the next time FSR starts.",
+                .labels = {"Auto (FSR 3.x)", "FSR 4 (AMD driver)"},
+                .is_visible = []() { return renodx::games::detroitbecomehuman::dlss::fsr::IsActive(); },
+            }},
+            {{
+                .key = "DLSSPreset",
+                .binding = &dlss_preset,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "DLSS Preset (restart game to apply)",
+                .section = "Upscaling",
+                .tooltip = "Chooses NVIDIA's DLSS render preset for every quality level. Default lets the driver choose. Newer DLSS versions use J, K, L and M; an unsupported preset falls back to the default. Takes effect the next time DLSS starts.",
+                .labels = {"Default", "A", "B", "C", "D", "E", "F", "J", "K", "L", "M"},
+                .is_visible = []() { return !renodx::games::detroitbecomehuman::dlss::fsr::IsActive(); },
+            }},
+            {{
+                .key = "DLSSMVJittered",
+                .binding = &dlss_mv_jittered,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "DLSS Motion Vectors Include Jitter (restart game)",
+                .section = "Upscaling",
+                .tooltip = "Detroit's motion vectors do not appear to include the camera jitter, so this should stay off. Takes effect the next time DLSS starts.",
+                .labels = {"Off", "On"},
+                .on_change_value = [](float, float) { SyncFsrTuning(); },
+                .is_visible = []() { return false; },
+            }},
+            {{
+                .key = "DLSSJitterMode",
+                .binding = &dlss_jitter_mode,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 3.f,
+                .can_reset = true,
+                .label = "DLSS Jitter",
+                .section = "Upscaling",
+                .tooltip = "If edges wobble or shimmer while the camera is still, try the other options. Takes effect within a second.",
+                .labels = {"Normal", "Flip X", "Flip Y", "Flip X+Y"},
+                .on_change_value = [](float, float) { SyncFsrTuning(); },
+                .is_visible = []() { return false; },
+            }},
+            {{
+                .key = "FSRJitterMode",
+                .binding = &fsr_jitter_mode,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 3.f,
+                .can_reset = true,
+                .label = "FSR Jitter",
+                .section = "Upscaling",
+                .tooltip = "If edges wobble or shimmer while the camera is still, try the other options. Takes effect immediately.",
+                .labels = {"Normal", "Flip X", "Flip Y", "Flip X+Y"},
+                .on_change_value = [](float, float) { SyncFsrTuning(); },
+                .is_visible = []() { return false; },
+            }},
+            {{
+                .key = "FSRJitterCancel",
+                .binding = &fsr_jitter_cancel,
+                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                .default_value = 0.f,
+                .can_reset = true,
+                .label = "FSR Motion Vectors Include Jitter",
+                .section = "Upscaling",
+                .tooltip = "Leave Off unless the image wobbles when nothing moves: Detroit's motion vectors do not include the camera jitter. Applies the next time FSR starts: switch Temporal Anti-Aliasing to Native TAA and back to FSR.",
+                .labels = {"Off", "On"},
+                .on_change_value = [](float, float) { SyncFsrTuning(); },
+                .is_visible = []() { return false; },
+            }},
+#endif
+            {{
+                .key = "DLSSBootstrapStatus",
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = "First-run setup",
+                .section = "Upscaling",
+            }},
+            {{
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = "The targeted " DETROIT_UPSCALER_NAME " Vulkan backend is unavailable; Native TAA remains active.",
+                .section = "Upscaling",
+                .is_visible = []() {
+                  return temporal_capture::GetStatus()
+                             == temporal_capture::RuntimeStatus::kNative
+                         && !embedded_hooks_active.load(std::memory_order_acquire);
+                },
+            }},
+            {{
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = "Native TAA is active. The two targeted Vulkan command hooks use direct lock-free trampolines.",
+                .section = "Upscaling",
+                .is_visible = []() {
+                  return temporal_capture::GetStatus()
+                             == temporal_capture::RuntimeStatus::kNative
+                         && embedded_hooks_active.load(std::memory_order_acquire);
+                },
+            }},
+            {{
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = DETROIT_UPSCALER_NAME " is selected; waiting for a complete verified TAA dispatch. Native TAA fallback is active.",
+                .section = "Upscaling",
+                .is_visible = []() {
+                  return temporal_capture::GetStatus()
+                         == temporal_capture::RuntimeStatus::kWaitingForDispatch;
+                },
+            }},
+            {{
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = "The TAA descriptor snapshot is incomplete. Native TAA fallback is active.",
+                .section = "Upscaling",
+                .is_visible = []() {
+                  return temporal_capture::GetStatus()
+                         == temporal_capture::RuntimeStatus::kDescriptorContractIncomplete;
+                },
+            }},
+            {{
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = "Diagnostic: a complete DLSS frame reached the bridge boundary. Bridge Configure/Evaluate are intentionally disabled.",
+                .section = "Upscaling",
+                .is_visible = []() {
+                  return temporal_capture::GetStatus()
+                         == temporal_capture::RuntimeStatus::kBridgeInputReadyDiagnostic;
+                },
+            }},
+            {{
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = "TAA resources were captured, but current-frame b52/jitter, depth, motion-vector, exposure, history and UI-free-color proofs are incomplete. NGX is fail-closed and Native TAA remains active.",
+                .section = "Upscaling",
+                .is_visible = []() {
+                  return temporal_capture::GetStatus()
+                         == temporal_capture::RuntimeStatus::kTemporalContractUnverified;
+                },
+            }},
+            {{
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = "The local DLSS bridge is unavailable or rejected this frame. Native TAA fallback is active.",
+                .section = "Upscaling",
+                .is_visible = []() {
+                  return temporal_capture::GetStatus()
+                         == temporal_capture::RuntimeStatus::kBridgeFallback;
+                },
+            }},
+            {{
+                .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                .label = DETROIT_UPSCALER_NAME " produced a valid result for this frame.",
+                .section = "Upscaling",
+                .is_visible = []() {
+                  return temporal_capture::GetStatus()
+                         == temporal_capture::RuntimeStatus::kDlssActive;
+                },
+            }},
+            {{
                 .key = "DepthOfFieldMode",
                 .binding = &dof_mode,
                 .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-                .default_value = 0.f,
+                .default_value = 1.f,
                 .can_reset = true,
                 .label = "Depth of Field",
                 .section = "Depth of Field",
@@ -2275,6 +2589,7 @@ renodx::utils::settings::Settings settings =
                 .is_enabled = []() {
                   return dof_mode >= 0.5f && dof_quality >= 0.5f;
                 },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "DepthOfFieldFillTransition",
@@ -2289,6 +2604,7 @@ renodx::utils::settings::Settings settings =
                 .is_enabled = []() {
                   return dof_mode >= 0.5f && dof_quality >= 0.5f;
                 },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "DepthOfFieldFillRgbReconstruction",
@@ -2303,6 +2619,7 @@ renodx::utils::settings::Settings settings =
                 .is_enabled = []() {
                   return dof_mode >= 0.5f && dof_quality >= 0.5f;
                 },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RetinalFixationX",
@@ -2522,11 +2839,13 @@ renodx::utils::settings::Settings settings =
                   experimental_motion_blur = current;
                   OnExperimentalMotionBlurSettingsChanged();
                 },
+                .is_visible = []() { return false; },
             }},
             {{
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
                 .label = "Experimental features are optional, disabled by default, and may vary by scene.",
                 .section = "Experimental",
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugMode",
@@ -2542,6 +2861,7 @@ renodx::utils::settings::Settings settings =
                   render_debug_mode = current;
                   OnRenderDebugSettingsChanged();
                 },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugDashboard",
@@ -2561,7 +2881,7 @@ renodx::utils::settings::Settings settings =
                     "Custom",
                     "DOF Vanilla Transition",
                 },
-                .is_visible = []() { return render_debug_mode >= 1.5f; },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugSource",
@@ -2572,10 +2892,7 @@ renodx::utils::settings::Settings settings =
                 .label = "Source",
                 .section = "Render Debug",
                 .labels = render_debug_source_labels,
-                .is_visible = []() {
-                  return render_debug_mode >= 0.5f
-                         && render_debug_mode < 1.5f;
-                },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugCustomSlot1",
@@ -2586,11 +2903,7 @@ renodx::utils::settings::Settings settings =
                 .label = "Custom Left",
                 .section = "Render Debug",
                 .labels = render_debug_source_labels,
-                .is_visible = []() {
-                  return render_debug_mode >= 1.5f
-                         && render_debug_dashboard >= 4.5f
-                         && render_debug_dashboard < 5.5f;
-                },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugCustomSlot2",
@@ -2601,11 +2914,7 @@ renodx::utils::settings::Settings settings =
                 .label = "Custom Center",
                 .section = "Render Debug",
                 .labels = render_debug_source_labels,
-                .is_visible = []() {
-                  return render_debug_mode >= 1.5f
-                         && render_debug_dashboard >= 4.5f
-                         && render_debug_dashboard < 5.5f;
-                },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugCustomSlot3",
@@ -2616,11 +2925,7 @@ renodx::utils::settings::Settings settings =
                 .label = "Custom Right",
                 .section = "Render Debug",
                 .labels = render_debug_source_labels,
-                .is_visible = []() {
-                  return render_debug_mode >= 1.5f
-                         && render_debug_dashboard >= 4.5f
-                         && render_debug_dashboard < 5.5f;
-                },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugChannel",
@@ -2632,6 +2937,7 @@ renodx::utils::settings::Settings settings =
                 .section = "Render Debug",
                 .labels = {"Auto", "RGB", "R", "G", "B", "Alpha", "Luminance", "Vector"},
                 .is_enabled = []() { return render_debug_mode >= 0.5f; },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugMapping",
@@ -2643,6 +2949,7 @@ renodx::utils::settings::Settings settings =
                 .section = "Render Debug",
                 .labels = {"Auto", "Linear", "Signed", "Log2"},
                 .is_enabled = []() { return render_debug_mode >= 0.5f; },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "RenderDebugOpacity",
@@ -2655,219 +2962,25 @@ renodx::utils::settings::Settings settings =
                 .max = 100.f,
                 .format = "%.0f%%",
                 .is_enabled = []() { return render_debug_mode >= 0.5f; },
+                .is_visible = []() { return false; },
             }},
             {{
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
                 .label = "Waiting for every required inline producer in one frame; the normal image remains active.",
                 .section = "Render Debug",
-                .is_visible = []() {
-                  return render_debug_mode >= 0.5f
-                         && render_debug_runtime_controller.GetStatus()
-                                == render_debug::RuntimeStatus::kWaitingForPasses;
-                },
+                .is_visible = []() { return false; },
             }},
             {{
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
                 .label = "The selected source is not verified for this path. Magenta checkerboard marks it as unavailable.",
                 .section = "Render Debug",
-                .is_visible = []() {
-                  return render_debug_mode >= 0.5f
-                         && RenderDebugSelectionUnavailable();
-                },
+                .is_visible = []() { return false; },
             }},
             {{
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
                 .label = "This executable revision is unsupported; Render Debug remains Off.",
                 .section = "Render Debug",
-                .is_visible = []() {
-                  return render_debug_mode >= 0.5f
-                         && render_debug_runtime_controller.GetStatus()
-                                == render_debug::RuntimeStatus::kUnsupportedBuild;
-                },
-            }},
-            {{
-                .key = "DLSSMode",
-                .binding = &dlss_mode,
-                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-#ifdef DETROIT_UPSCALER_FSR
-                .default_value = static_cast<float>(DETROIT_DLSS_MODE_DLAA),
-#else
-                .default_value = static_cast<float>(DETROIT_DLSS_MODE_NATIVE),
-#endif
-                .can_reset = true,
-                .label = "Temporal Anti-Aliasing",
-                .section = "DLSS",
-#ifdef DETROIT_UPSCALER_FSR
-                .tooltip = "DLSS or FSR (see Upscaler below) replaces Detroit's native TAA. At 100% Resolution Scaling it works as anti-aliasing only; lower the game's Resolution Scaling and it upscales to your output resolution.",
-#else
-                .tooltip = DETROIT_UPSCALER_NAME " replaces Detroit's native TAA at output resolution. The game Resolution Scaling setting must be 100%; reduced render extents fail closed to Native TAA. DLSS Super Resolution is not included.",
-#endif
-                .labels = {"Native TAA", DETROIT_UPSCALER_NAME},
-                .is_enabled = []() { return embedded_dlss::kDlssRuntimeEnabled; },
-                .on_change_value = [](float, float current) { ApplyDlssMode(current); },
-            }},
-            {{
-                .key = "DLAASharpening",
-                .binding = &dlaa_sharpening,
-                .default_value = 0.f,
-                .can_reset = true,
-                .label = DETROIT_UPSCALER_NAME " Sharpening",
-                .section = "DLSS",
-                .tooltip = "Scene-linear RCAS applied to the successful NGX output before Detroit's DOF. Zero is an exact passthrough.",
-                .min = 0.f,
-                .max = 100.f,
-                .is_enabled = []() { return embedded_dlss::kDlssRuntimeEnabled
-                                            && temporal_capture::GetMode()
-                                                   == DETROIT_DLSS_MODE_DLAA; },
-                .parse = [](float value) { return value * 0.01f; },
-                .on_change_value = [](float, float) { SyncDlaaSharpening(); },
-            }},
-#ifdef DETROIT_UPSCALER_FSR
-            {{
-                .key = "UpscalerBackend",
-                .binding = &upscaler_backend,
-                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-                .default_value = 0.f,
-                .can_reset = true,
-                .label = "Upscaler (restart game to apply)",
-                .section = "DLSS",
-                .tooltip = "Auto uses DLSS when an NVIDIA driver is present and nvngx_dlss.dll is in the game folder, otherwise FSR. Restart the game after changing this. The first DLSS launch needs one extra restart.",
-                .labels = {"Auto", "FSR", "DLSS"},
-            }},
-            {{
-                .key = "UncapFps",
-                .binding = &uncap_fps,
-                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-                .default_value = 0.f,
-                .can_reset = true,
-                .label = "Uncap FPS (restart game to apply)",
-                .section = "DLSS",
-                .tooltip = "Sets the game's frame rate limit to Off in GraphicOptions.JSON each time the game starts, even if the game's own options re-enable the cap. Takes effect on the next launch.",
-                .labels = {"Off", "On"},
-                .on_change_value = [](float, float current) {
-                  if (current >= 0.5f) ApplyUncapFps();
-                },
-            }},
-            {{
-                .key = "ResolutionScaleOverride",
-                .binding = &resolution_scale_override,
-                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-                .default_value = 0.f,
-                .can_reset = true,
-                .label = "Resolution Scale (restart game to apply)",
-                .section = "DLSS",
-                .tooltip = "Sets the game's Resolution Scaling in GraphicOptions.JSON each time the game starts, so it stays put even if the game's own options change it. The game's minimum is 70%. Game setting leaves the game's menu in control. Takes effect on the next launch.",
-                .labels = {"Game setting", "100%", "90%", "80%", "70%"},
-                .on_change_value = [](float, float current) {
-                  ApplyResolutionScaleOverride(static_cast<int>(current + 0.5f));
-                },
-            }},
-            {{
-                .key = "FSRJitterMode",
-                .binding = &fsr_jitter_mode,
-                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-                .default_value = 3.f,
-                .can_reset = true,
-                .label = "FSR Jitter",
-                .section = "DLSS",
-                .tooltip = "If edges wobble or shimmer while the camera is still, try the other options. Takes effect immediately.",
-                .labels = {"Normal", "Flip X", "Flip Y", "Flip X+Y"},
-                .on_change_value = [](float, float) { SyncFsrTuning(); },
-                .is_visible = []() { return renodx::games::detroitbecomehuman::dlss::fsr::IsActive(); },
-            }},
-            {{
-                .key = "FSRJitterCancel",
-                .binding = &fsr_jitter_cancel,
-                .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-                .default_value = 1.f,
-                .can_reset = true,
-                .label = "FSR Motion Vectors Include Jitter",
-                .section = "DLSS",
-                .tooltip = "Applies the next time FSR starts: switch Temporal Anti-Aliasing to Native TAA and back to FSR.",
-                .labels = {"Off", "On"},
-                .on_change_value = [](float, float) { SyncFsrTuning(); },
-                .is_visible = []() { return renodx::games::detroitbecomehuman::dlss::fsr::IsActive(); },
-            }},
-#endif
-            {{
-                .key = "DLSSBootstrapStatus",
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "First-run setup",
-                .section = "DLSS",
-            }},
-            {{
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "The targeted " DETROIT_UPSCALER_NAME " Vulkan backend is unavailable; Native TAA remains active.",
-                .section = "DLSS",
-                .is_visible = []() {
-                  return temporal_capture::GetStatus()
-                             == temporal_capture::RuntimeStatus::kNative
-                         && !embedded_hooks_active.load(std::memory_order_acquire);
-                },
-            }},
-            {{
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "Native TAA is active. The two targeted Vulkan command hooks use direct lock-free trampolines.",
-                .section = "DLSS",
-                .is_visible = []() {
-                  return temporal_capture::GetStatus()
-                             == temporal_capture::RuntimeStatus::kNative
-                         && embedded_hooks_active.load(std::memory_order_acquire);
-                },
-            }},
-            {{
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = DETROIT_UPSCALER_NAME " is selected; waiting for a complete verified TAA dispatch. Native TAA fallback is active.",
-                .section = "DLSS",
-                .is_visible = []() {
-                  return temporal_capture::GetStatus()
-                         == temporal_capture::RuntimeStatus::kWaitingForDispatch;
-                },
-            }},
-            {{
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "The TAA descriptor snapshot is incomplete. Native TAA fallback is active.",
-                .section = "DLSS",
-                .is_visible = []() {
-                  return temporal_capture::GetStatus()
-                         == temporal_capture::RuntimeStatus::kDescriptorContractIncomplete;
-                },
-            }},
-            {{
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "Diagnostic: a complete DLSS frame reached the bridge boundary. Bridge Configure/Evaluate are intentionally disabled.",
-                .section = "DLSS",
-                .is_visible = []() {
-                  return temporal_capture::GetStatus()
-                         == temporal_capture::RuntimeStatus::kBridgeInputReadyDiagnostic;
-                },
-            }},
-            {{
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "TAA resources were captured, but current-frame b52/jitter, depth, motion-vector, exposure, history and UI-free-color proofs are incomplete. NGX is fail-closed and Native TAA remains active.",
-                .section = "DLSS",
-                .is_visible = []() {
-                  return temporal_capture::GetStatus()
-                         == temporal_capture::RuntimeStatus::kTemporalContractUnverified;
-                },
-            }},
-            {{
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "The local DLSS bridge is unavailable or rejected this frame. Native TAA fallback is active.",
-                .section = "DLSS",
-                .is_visible = []() {
-                  return temporal_capture::GetStatus()
-                         == temporal_capture::RuntimeStatus::kBridgeFallback;
-                },
-            }},
-            {{
-                .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = DETROIT_UPSCALER_NAME " produced a valid result for this frame.",
-                .section = "DLSS",
-                .is_visible = []() {
-                  return temporal_capture::GetStatus()
-                         == temporal_capture::RuntimeStatus::kDlssActive;
-                },
+                .is_visible = []() { return false; },
             }},
             {{
                 .key = "AspectRatioMode",
@@ -2885,7 +2998,7 @@ renodx::utils::settings::Settings settings =
             }},
             {{
                 .value_type = renodx::utils::settings::SettingValueType::TEXT,
-                .label = "Ultrawide is signature-gated to Steam Build 12158144. At 3440x1440 Auto uses a 43:18 scene and a centered 16:9-size UI.",
+                .label = "Ultrawide is signature-gated to the Steam (Build 12158144) and Epic Games Store builds. At 3440x1440 Auto uses a 43:18 scene and a centered 16:9-size UI.",
                 .section = "Ultrawide",
             }},
 #else
@@ -3408,7 +3521,7 @@ bool AttachAddon(HMODULE h_module) {
     if (uncap >= 0.5f) ApplyUncapFps();
     float scale_choice = 0.f;
     (void)reshade::get_config_value(
-        nullptr, "renodx-preset1", "ResolutionScaleOverride", scale_choice);
+        nullptr, "renodx-preset1", "ResolutionScalePreset", scale_choice);
     ApplyResolutionScaleOverride(static_cast<int>(scale_choice + 0.5f));
   }
   initial_extension_cache = ReadExtensionCache();
